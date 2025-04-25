@@ -1,16 +1,10 @@
 #!/usr/bin/env python
 """
-visualize_results.py   –  ‘best-layer’ view
-Shows (1) a glass-brain of the voxel-wise *max* R² across layers and
-(2) a bar chart of the best-explained ROIs colour-coded by the winning
-layer.
+visualize_results.py  –  best-layer view (trimmed, ceiling-norm)
 
-Usage
------
-python scripts/visualize_results.py --subj CSI1 --metric r2 --surface
-# optional:
-#   --top-n 20         show 20 best ROIs (default 15)
-#   --layers layer1 layer4   restrict to a subset of layers
+• Glass-brain: voxel-wise *max* R² across layers, threshold = 95th pct.
+• ROI bars   : (top-25 % mean R²) ÷ (ROI noise ceiling)  → 0-to-1 scale.
+               Colour = layer that wins the ROI.
 """
 from __future__ import annotations
 import argparse, logging, gc
@@ -19,144 +13,147 @@ from typing import List
 
 import numpy as np
 import matplotlib.pyplot as plt
+from matplotlib import cm
 import pandas as pd
 from nilearn import image, masking, plotting, datasets, surface
 from nilearn.image import resample_to_img
-from matplotlib import cm
 
-
-
-
-# ── paths & logger ──────────────────────────────────────────────────────
+# ───────────────────────── paths & logger ──────────────────────────────
 try:
     from config import RESULT_DIR, DERIV, LOGGER
 except ModuleNotFoundError:
     RESULT_DIR = Path(__file__).resolve().parents[1] / "results"
     DERIV      = Path(__file__).resolve().parents[1] / "data"
     logging.basicConfig(level=logging.INFO,
-                        format="%(asctime)s | %(levelname)-7s | %(message)s",
-                        datefmt="%H:%M:%S")
+                        format="%(asctime)s | %(levelname)-7s | %(message)s")
     LOGGER = logging.getLogger("visualize")
 
-# ── CLI ─────────────────────────────────────────────────────────────────
+# ──────────────────────────── CLI ───────────────────────────────────────
 p = argparse.ArgumentParser()
 p.add_argument("--subj", required=True, help="e.g. CSI1 (without 'sub-')")
-p.add_argument("--layers", nargs="*",
-               help="Layers to include; default = all layers found")
-p.add_argument("--metric", default="r2", choices=["r", "r2"],
-               help="Which map to summarise (default=r2)")
-p.add_argument("--threshold", type=float, default=0.05,
-               help="Display threshold for glass-brain (default=0.05)")
-p.add_argument("--surface", action="store_true",
-               help="Also draw inflated cortical surface")
-p.add_argument("--top-n", type=int, default=15,
-               help="Show this many best ROIs in the bar chart (default=15)")
+p.add_argument("--layers", nargs="*")
+p.add_argument("--metric", default="r2", choices=["r", "r2"])
+p.add_argument("--surface", action="store_true")
+p.add_argument("--top-n", type=int, default=15)
 args = p.parse_args()
 subj_prefix = f"sub-{args.subj}"
 
-# ── layer list ──────────────────────────────────────────────────────────
+# ───────────────── layer list ───────────────────────────────────────────
 if args.layers:
     layers: List[str] = args.layers
 else:
     pattern = RESULT_DIR.glob(f"{subj_prefix}_*_*_{args.metric}.nii.gz")
-    layers = sorted({
-        "_".join(Path(p).stem.split("_")[1:-1])   # strip subj & metric
-        for p in pattern
-    })
-    LOGGER.info("Auto-detected layers: %s", ", ".join(layers))
+    layers = sorted({"_".join(Path(p).stem.split("_")[1:-1]) for p in pattern})
 if not layers:
     raise RuntimeError("No layers found – did you run evaluate.py?")
+LOGGER.info("Layers: %s", ", ".join(layers))
 
-# ── atlas & resampling ──────────────────────────────────────────────────
-atlas          = datasets.fetch_atlas_harvard_oxford("cort-maxprob-thr25-2mm")
-atlas_img_raw  = image.load_img(atlas.maps)
-metric_path    = RESULT_DIR / f"{subj_prefix}_{layers[-1]}_{args.metric}.nii.gz"
-metric_img_ref = image.load_img(metric_path)
-atlas_img      = resample_to_img(atlas_img_raw, metric_img_ref,
-                                 interpolation="nearest")
-atlas_data     = atlas_img.get_fdata().astype("int16")
-atlas_labels   = atlas.labels
-roi_ids        = np.arange(1, len(atlas_labels))
+# ─────────── atlas & resampling to subject space ───────────────────────
+atlas  = datasets.fetch_atlas_harvard_oxford("cort-maxprob-thr25-2mm")
+a_img  = image.load_img(atlas.maps)
+ref    = image.load_img(RESULT_DIR / f"{subj_prefix}_{layers[-1]}_{args.metric}.nii.gz")
+a_img  = resample_to_img(a_img, ref, interpolation="nearest")
+a_dat  = a_img.get_fdata().astype("int16")
+labels = atlas.labels
+roi_ids= np.arange(1, len(labels))
 
-# ── load maps & compute voxel-wise max ──────────────────────────────────
-maps, stack = {}, []
-for layer in layers:
-    img = image.load_img(RESULT_DIR / f"{subj_prefix}_{layer}_{args.metric}.nii.gz")
-    maps[layer] = img
-    stack.append(img.get_fdata(dtype="float32"))
-stack = np.stack(stack, axis=-1)                     # (X, Y, Z, L)
-max_data = stack.max(-1)
-best_idx = stack.argmax(-1)                          # which layer won per voxel
-best_img = image.new_img_like(metric_img_ref, max_data.astype("float32"))
+# ───────────── stack maps & voxel-wise max ─────────────────────────────
+stack = np.stack(
+    [image.load_img(RESULT_DIR / f"{subj_prefix}_{ly}_{args.metric}.nii.gz")
+        .get_fdata(dtype="float32") for ly in layers],
+    axis=-1
+)                                           # (X,Y,Z,L)
+best_img = image.new_img_like(ref, stack.max(-1))
 
-# ── ROI table: best layer per region ────────────────────────────────────
+# ───────────── optional reliability (noise ceiling) ────────────────────
+rel_path = RESULT_DIR / f"{subj_prefix}_reliability_mask.npy"
+rel_map  = (np.load(rel_path) if rel_path.exists() else
+            np.ones_like(stack[...,0], dtype="float32"))
+EPS = 1e-6
+
+# ───────────── ROI table (top-25 % trimmed, ceiling-norm) ──────────────
 records = []
 for roi in roi_ids:
-    roi_mask = (atlas_data == roi)
-    if roi_mask.sum() == 0:
+    mask = (a_dat == roi) & (rel_map > 0)        # keep reliable voxels only
+    if mask.sum() < 100:                         # ignore tiny ROIs
         continue
-    reliab   = np.load(RESULT_DIR / f"{subj_prefix}_reliability_mask.npy")
-    roi_vals = stack[roi_mask & (reliab.astype(bool))]
-    if roi_vals.size == 0:
-        continue
+    roi_vals = stack[mask]                       # (vox, L)
+    rel_vals = rel_map[mask]
+    # trimmed mean: top 25 %
+    cut = int(0.75 * roi_vals.shape[0])
+    roi_vals = np.sort(roi_vals, axis=0)[cut:]
+
     mean_by_layer = roi_vals.mean(0)
-    best_layer_idx = int(mean_by_layer.argmax())
-    records.append({
-        "ROI":        atlas_labels[roi],
-        "BestLayer":  layers[best_layer_idx],
-        "MeanR2":     float(mean_by_layer[best_layer_idx])
-    })
+    best_idx = int(mean_by_layer.argmax())
+    ceiling = rel_vals.mean()
+    records.append(dict(
+        ROI       = labels[roi],
+        BestLayer = layers[best_idx],
+        FracVar   = float(mean_by_layer[best_idx] / (ceiling + EPS))
+    ))
     gc.collect()
 
+if not records:
+    LOGGER.warning("No ROI passed the reliability / size filter; "
+                    "falling back to untrimmed mean R².")
+    for roi in roi_ids:
+        roi_mask = (a_dat == roi)
+        if not roi_mask.any():
+            continue
+        vals = stack[roi_mask].mean(0)
+        best = int(vals.argmax())
+        records.append(dict(ROI=labels[roi],
+                            BestLayer=layers[best],
+                            FracVar=float(vals[best])))
+
 df = (pd.DataFrame(records)
-        .sort_values("MeanR2", ascending=False)
+        .sort_values("FracVar", ascending=False)
         .head(args.top_n))
 
-# colour palette: one colour per layer
+# ───────────── colour palette ──────────────────────────────────────────
 cmap = cm.get_cmap("tab10")
 layer_colors = {l: cmap(i % 10) for i, l in enumerate(layers)}
 
-# ── figure layout ───────────────────────────────────────────────────────
+# ───────────── figure layout ───────────────────────────────────────────
 n_rows = 2 if args.surface else 1
 fig = plt.figure(figsize=(11, 3.5 * n_rows + 0.5 * len(df)))
-gs  = fig.add_gridspec(n_rows, 2,
-                       height_ratios=[3] + ([3] if args.surface else []))
+gs  = fig.add_gridspec(n_rows, 2, height_ratios=[3] + ([3] if args.surface else []))
 
-# ── (A) Glass-brain of voxel-wise max ───────────────────────────────────
+# (A) glass-brain – auto threshold (95th pct of non-zero voxels)
+nonzero = best_img.get_fdata()[best_img.get_fdata()>0]
+thr = np.percentile(nonzero, 95) if nonzero.size else 0.05
 ax_brain = fig.add_subplot(gs[0, 0])
-plotting.plot_glass_brain(best_img, threshold=args.threshold,
+plotting.plot_glass_brain(best_img, threshold=thr,
                           display_mode="lyrz", colorbar=True, axes=ax_brain,
-                          title=f"Voxel-wise best {args.metric.upper()} (max over layers)")
+                          title=f"Voxel-wise best {args.metric.upper()} (thr={thr:.3f})")
 
-# optionally surface plot
+# optional surface
 if args.surface:
     fsavg   = datasets.fetch_surf_fsaverage()
-    texture = surface.vol_to_surf(best_img, fsavg.pial_left)
+    txt     = surface.vol_to_surf(best_img, fsavg.pial_left)
     ax_surf = fig.add_subplot(gs[0, 1], projection="3d")
-    plotting.plot_surf_stat_map(fsavg.infl_left, texture, hemi="left",
-                                threshold=args.threshold,
-                                bg_map=fsavg.sulc_left,
+    plotting.plot_surf_stat_map(fsavg.infl_left, txt, hemi="left",
+                                threshold=thr, bg_map=fsavg.sulc_left,
                                 axes=ax_surf, colorbar=False)
 else:
-    ax = fig.add_subplot(gs[0, 1]); ax.axis("off")
+    fig.add_subplot(gs[0,1]).axis("off")
 
-# ── (B) ROI bar chart of best layer ─────────────────────────────────────
+# (B) bar chart
 ax_bar = fig.add_subplot(gs[-1, :])
-bars = ax_bar.bar(np.arange(len(df)), df["MeanR2"],
-                  color=[layer_colors[l] for l in df["BestLayer"]],
-                  alpha=0.9)
+bars   = ax_bar.bar(np.arange(len(df)), df["FracVar"],
+                    color=[layer_colors[l] for l in df["BestLayer"]])
 ax_bar.set_xticks(np.arange(len(df)))
 ax_bar.set_xticklabels(df["ROI"], rotation=90)
-ax_bar.set_ylabel(f"Mean {args.metric.upper()}  (best layer)")
+ax_bar.set_ylabel("Explained / ceiling")
 ax_bar.margins(x=0.01)
-# legend for layers
+# legend
 handles = [plt.Rectangle((0,0),1,1,color=layer_colors[l]) for l in layers]
 ax_bar.legend(handles, layers, title="Winning layer",
               bbox_to_anchor=(1.02, 1), loc="upper left")
 fig.tight_layout()
 
-# ── save ────────────────────────────────────────────────────────────────
+# ───────────── save ────────────────────────────────────────────────────
 out_dir = RESULT_DIR / "figures"; out_dir.mkdir(exist_ok=True)
 for ext in ("png", "pdf"):
     fig.savefig(out_dir / f"{subj_prefix}_encoding_summary.{ext}", dpi=300)
-LOGGER.info("Saved figure → %s", out_dir / f"{subj_prefix}_encoding_summary.png")
+LOGGER.info("Saved → %s", out_dir / f"{subj_prefix}_encoding_summary.png")
