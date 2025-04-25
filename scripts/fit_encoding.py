@@ -1,124 +1,138 @@
 #!/usr/bin/env python
 """
 fit_encoding.py
-Voxel-wise ridge regression for ONE DNN layer, truly laptop-safe.
-
-Usage examples
---------------
-python scripts/fit_encoding.py --layer resnet50_layer1 --subj CSI1
-python scripts/fit_encoding.py --layer resnet50_layer3              # all subjects
+Voxel-wise ridge regression with an 8-TR FIR design and group-wise CV.
 """
 from __future__ import annotations
 import argparse, gc
 from pathlib import Path
-import numpy as np, pandas as pd
+
+import numpy as np
+import pandas as pd
 from sklearn.linear_model import Ridge, RidgeCV
-from sklearn.model_selection import KFold
+from sklearn.model_selection import GroupKFold
 from bids import BIDSLayout
 
-from config import RAW, DERIV, FEAT_DIR, MODEL_DIR, RESULT_DIR, LOGGER
+from config import RAW, DERIV, FEAT_DIR, RESULT_DIR, LOGGER
+
+# ────────── parameters ──────────
+HRF_WEIGHTS = np.ones(8, dtype=np.float32)  # FIR window: 8 TRs = 0–7 s
+HRF_LAG_TR  = 2                             # start 2 TR (≈2 s) after onset
+VOX_BATCH   = 100                           # keep RAM in check
+ALPHAS      = np.logspace(1, 5, 5)
 
 # ────────── helpers ──────────
-def cleaned_npy(run_nifti_path: str, subj: str) -> Path:
+def cleaned_npy(run_path: str, subj: str) -> Path:
     return (DERIV / f"sub-{subj}" /
-            Path(run_nifti_path).name
-                .replace("_bold.nii.gz", "_bold.npy")
-                .replace("_bold.nii",  "_bold.npy"))
+            Path(run_path).name.replace("_bold.nii.gz", "_bold.npy")
+                              .replace("_bold.nii",  "_bold.npy"))
 
-def trial_rows(ev_path: Path) -> np.ndarray:
-    ev = pd.read_csv(ev_path, sep="\t").dropna(subset=["feat_row"])
-    return ev["feat_row"].astype(int).to_numpy()
+def load_events(ev_path: Path) -> pd.DataFrame:
+    return (pd.read_csv(ev_path, sep="\t")
+              .dropna(subset=["feat_row"])[["onset", "feat_row"]])
+
+def build_design(n_tr: int,
+                 events: pd.DataFrame,
+                 features: np.memmap,
+                 tr_sec: float) -> np.ndarray:
+    """Return (n_tr, p) FIR design matrix."""
+    p  = features.shape[1]
+    X  = np.zeros((n_tr, p), dtype=np.float32)
+
+    onsets_tr = (events["onset"].to_numpy() / tr_sec).round().astype(int)
+    rows      = events["feat_row"].to_numpy().astype(int)
+
+    for t0, row in zip(onsets_tr + HRF_LAG_TR, rows):
+        for k, w in enumerate(HRF_WEIGHTS):
+            t = t0 + k
+            if t < n_tr:
+                X[t] += w * features[row]
+    return X
 
 # ────────── CLI ──────────
 ap = argparse.ArgumentParser()
 ap.add_argument("--layer", required=True)
-ap.add_argument("--subj", nargs="*", default=None,
-                help="IDs without 'sub-'; omit to run all")
-args = ap.parse_args()
-LAYER = args.layer
+ap.add_argument("--subj",  nargs="*", default=None)
+args    = ap.parse_args()
+LAYER   = args.layer
 
-# ────────── load DNN features (on-disk) ──────────
-X_mmap = np.load(FEAT_DIR / f"{LAYER}.npy", mmap_mode="r")   # (n_img, p)
-LOGGER.info("Loaded %s (mmap, shape=%s)", LAYER, X_mmap.shape)
+# ────────── feature matrix ──────────
+X_mmap = np.load(FEAT_DIR / f"{LAYER}.npy", mmap_mode="r")
+LOGGER.info("Loaded features shape = %s", X_mmap.shape)
 
-EVENT_SUFFIX = "_events_with_feat_row.tsv"
-layout = BIDSLayout(RAW, validate=False)
+# ────────── iterate subjects ────────
+layout   = BIDSLayout(RAW, validate=False)
 subjects = args.subj or [p.name.split("-")[1] for p in DERIV.glob("sub-*")]
 
 for subj in subjects:
-    LOGGER.info("=== %s : %s ===", subj, LAYER)
+    LOGGER.info("=== Subject %s | %s ===", subj, LAYER)
 
-    runs = layout.get(subject=subj, task="5000scenes",
-                      suffix="bold", extension=[".nii", ".nii.gz"])
+    runs = sorted(layout.get(subject=subj, task="5000scenes",
+                             suffix="bold", extension=[".nii", ".nii.gz"]),
+                  key=lambda r: r.path)
     if not runs:
-        LOGGER.warning("  no raw runs – skipping")
+        LOGGER.warning("  no runs – skipping")
         continue
 
-    # ---------- assemble design matrices ----------
-    X_rows, Y_parts = [], []
-    for r in sorted(runs, key=lambda r: r.path):
-        ev_p = Path(r.path.replace("_bold.nii.gz", EVENT_SUFFIX)
-                              .replace("_bold.nii",  EVENT_SUFFIX))
-        idx = trial_rows(ev_p)              # rows for *stimuli* in this run
-        if idx.size == 0:
+    X_parts, Y_parts, group_ids = [], [], []
+    for run_idx, r in enumerate(runs):
+        tr_sec = float(r.get_metadata().get("RepetitionTime", 1.0))
+        ev_p   = Path(r.path.replace("_bold.nii.gz", "_events_with_feat_row.tsv")
+                              .replace("_bold.nii",  "_events_with_feat_row.tsv"))
+        if not ev_p.exists():
             continue
 
-        run_Y = np.load(cleaned_npy(r.path, subj))     # (TR, vox)
-        Y_parts.append(run_Y[idx])                     # keep only stimulus TRs
-        X_rows.append(idx)
+        ev_df = load_events(ev_p)
+        Y_run = np.load(cleaned_npy(r.path, subj))          # (TR, vox)
+        X_run = build_design(Y_run.shape[0], ev_df, X_mmap, tr_sec)
 
-    if not X_rows:
+        keep = X_run.any(1)
+        if not keep.sum():
+            continue
+        X_parts.append(X_run[keep])
+        Y_parts.append(Y_run[keep])
+        group_ids.extend([run_idx] * keep.sum())
+
+    if not X_parts:
         LOGGER.warning("  no usable trials – skipping")
         continue
 
-    #  match voxel count across runs
-    min_vox = min(a.shape[1] for a in Y_parts)
-    Y_parts = [a[:, :min_vox] for a in Y_parts]
+    # equalise voxel count across runs
+    min_vox   = min(y.shape[1] for y in Y_parts)
+    Y_parts   = [y[:, :min_vox] for y in Y_parts]
 
-    # ── slice once, copy to float32 ──
-    X_all = np.asarray(X_mmap[np.concatenate(X_rows)], dtype=np.float32)
-    Y_all = np.concatenate(Y_parts, axis=0).astype(np.float32)
+    X_all = np.vstack(X_parts).astype(np.float32)
+    Y_all = np.vstack(Y_parts).astype(np.float32)
+    groups = np.array(group_ids, dtype=int)
+    del X_parts, Y_parts; gc.collect()
 
-    # free the per-run arrays immediately
-    del Y_parts; gc.collect()
+    # z-score
+    X_all = (X_all - X_all.mean(0, keepdims=True)) / (X_all.std(0, keepdims=True) + 1e-6)
+    Y_all = (Y_all - Y_all.mean(0, keepdims=True)) / (Y_all.std(0, keepdims=True) + 1e-6)
 
-    kfold = KFold(n_splits=2, shuffle=True, random_state=42)
-    tr_idx, te_idx = next(kfold.split(X_all))
+    # group-wise split (train/test on different runs)
+    tr_idx, te_idx = next(GroupKFold(n_splits=2).split(X_all, groups=groups))
 
-    # ---------- cross-validate α on 500 random voxels ----------
-    vox_sample = np.random.choice(Y_all.shape[1], 500, replace=False)
-    ridge_cv = RidgeCV(alphas=np.logspace(1, 5, 5),
-                       scoring="r2", cv=3, fit_intercept=False)
-    ridge_cv.fit(X_all[tr_idx], Y_all[tr_idx][:, vox_sample])
-    best_alpha = float(ridge_cv.alpha_)
-    LOGGER.info("    best α (500-voxel CV) = %.0f", best_alpha)
+    # hyper-parameter CV
+    vox_sample = np.random.choice(Y_all.shape[1], min(500, Y_all.shape[1]), replace=False)
+    α = float(RidgeCV(alphas=ALPHAS, scoring="r2", cv=3,
+                      fit_intercept=False).fit(
+                      X_all[tr_idx], Y_all[tr_idx][:, vox_sample]).alpha_)
+    LOGGER.info("  best α = %.0f", α)
 
-    base_ridge = Ridge(alpha=best_alpha, fit_intercept=False)
+    base_ridge = Ridge(alpha=α, fit_intercept=True)
 
-    # ---------- batched fit & predict ----------
-    VOX_BATCH = 100
+    # batched fit & predict
     Y_pred_parts = []
-    te_X = X_all[te_idx]
+    for s in range(0, Y_all.shape[1], VOX_BATCH):
+        e = min(s + VOX_BATCH, Y_all.shape[1])
+        base_ridge.fit(X_all[tr_idx], Y_all[tr_idx, s:e])
+        Y_pred_parts.append(base_ridge.predict(X_all[te_idx]))
+    Y_pred = np.hstack(Y_pred_parts)
 
-    for start in range(0, Y_all.shape[1], VOX_BATCH):
-        stop = min(start + VOX_BATCH, Y_all.shape[1])
-        base_ridge.fit(X_all[tr_idx], Y_all[tr_idx, start:stop])
-        Y_pred_parts.append(base_ridge.predict(te_X))
-
-        if (start // VOX_BATCH) % 20 == 0:
-            LOGGER.info("    voxels %d-%d / %d", start, stop, Y_all.shape[1])
-
-    Y_pred = np.concatenate(Y_pred_parts, axis=1)      # (n_te, vox)
-
-    # ---------- save ----------
-    MODEL_DIR.mkdir(exist_ok=True)
+    # save (float16)
     RESULT_DIR.mkdir(exist_ok=True)
-
-    # coefficients only (float32) → ~1.3 GB for layer4, ≪ that for others
-    np.save(RESULT_DIR / f"sub-{subj}_{LAYER}_coef.npy",
-            base_ridge.coef_.astype(np.float32))
-
-    # predictions + ground truth for evaluation
-    np.save(RESULT_DIR / f"sub-{subj}_{LAYER}_pred.npy", Y_pred)
-    np.save(RESULT_DIR / f"sub-{subj}_{LAYER}_true.npy", Y_all[te_idx])
-    LOGGER.info("    saved coef, pred, and truth arrays")
+    np.save(RESULT_DIR / f"sub-{subj}_{LAYER}_pred.npy",  Y_pred.astype(np.float16))
+    np.save(RESULT_DIR / f"sub-{subj}_{LAYER}_true.npy",  Y_all[te_idx].astype(np.float16))
+    LOGGER.info("  saved predictions (%s TR × %s vox)  [float16]",
+                Y_pred.shape[0], Y_pred.shape[1])

@@ -3,6 +3,12 @@
 extract_features.py
 Global-average-pooled ResNet-50 features for every stimulus JPEG/PNG.
 Outputs one .npy per layer (float32) + stimulus_index.csv.
+
+*Change log*
+-------------
+✓ `stimulus_id` is now **the path relative to SCENE_ROOT** (e.g.
+  ``COCO/val2017/000000123456.jpg``) instead of only the bare file-name.  
+  This removes name collisions across COCO / ImageNet / Scene folders.
 """
 from pathlib import Path
 from typing import List
@@ -14,10 +20,11 @@ import torch
 from torchvision import models
 from tqdm import tqdm
 
-from config import FEAT_DIR, LOGGER, get_all_scene_files
+from config import FEAT_DIR, LOGGER, get_all_scene_files, SCENE_ROOT
 
 DEVICE  = "cuda" if torch.cuda.is_available() else "cpu"
 LAYERS  = ["layer1", "layer2", "layer3", "layer4"]     # conv2_x – conv5_x
+
 
 def main() -> None:
     scene_files: List[Path] = get_all_scene_files()
@@ -30,12 +37,9 @@ def main() -> None:
     activations = {ln: [] for ln in LAYERS}
 
     def _capture(name: str):
-        """
-        Hook that global-avg-pools H×W so each output → (B, C),
-        keeping only the *channel-wise* activation pattern.
-        """
+        """Hook that global-avg-pools H×W → (B, C)."""
         def hook(_, __, out):
-            pooled = out.mean(dim=(2, 3))        # (B, C, H, W) → (B, C)
+            pooled = out.mean(dim=(2, 3))      # (B, C, H, W) → (B, C)
             activations[name].append(pooled.cpu().to(torch.float32))
         return hook
 
@@ -47,7 +51,7 @@ def main() -> None:
     with torch.inference_mode():
         for img_path in tqdm(scene_files, desc="ResNet-50"):
             img = preprocess(Image.open(img_path).convert("RGB")).unsqueeze(0).to(DEVICE)
-            resnet(img)          # hooks fill `activations`
+            resnet(img)              # hooks fill `activations`
 
     # ─── save ───
     FEAT_DIR.mkdir(exist_ok=True)
@@ -57,9 +61,10 @@ def main() -> None:
         LOGGER.info("%s: saved %s", ln, arr.shape)
 
     pd.DataFrame({
-        "stimulus_id": [p.name for p in scene_files],
-        "filepath"   : [str(p)  for p in scene_files],
+        "stimulus_id": [p.relative_to(SCENE_ROOT).as_posix() for p in scene_files],
+        "filepath"   : [str(p) for p in scene_files],
     }).to_csv(FEAT_DIR / "stimulus_index.csv", index=False)
+
 
 if __name__ == "__main__":
     main()

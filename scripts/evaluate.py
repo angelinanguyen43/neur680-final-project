@@ -1,45 +1,75 @@
 #!/usr/bin/env python
 """
-evaluate.py
-Compute voxel-wise Pearson r and R² for held-out trials.
+evaluate.py   –  fast, low-RAM, auto-cleanup
+Loads float16 predictions/truth, computes r & R² in 128-voxel chunks,
+writes NIfTIs, then deletes the heavy .npy files (unless --keep is given).
 """
 from __future__ import annotations
-import argparse, numpy as np, nibabel as nib
+import argparse, gc
 from pathlib import Path
+
+import numpy as np
+import nibabel as nib
+from tqdm import tqdm
+
 from config import DERIV, RESULT_DIR, LOGGER
 
-p = argparse.ArgumentParser()
-p.add_argument("--layer", required=True,
-               help="Layer name used in fit_encoding, e.g. resnet50_layer1")
-p.add_argument("--subj",  nargs="*", default=None,
-               help="Subject IDs; omit to evaluate all")
-args = p.parse_args()
-LAYER: str = args.layer
-EPS = 1e-10
+EPS        = 1e-7
+VOX_BATCH  = 128
+
+# ────────── CLI ──────────
+cli = argparse.ArgumentParser()
+cli.add_argument("--layer", required=True)
+cli.add_argument("--subj",  nargs="*", default=None)
+cli.add_argument("--keep",  action="store_true",
+                 help="Keep *_pred.npy and *_true.npy after evaluation")
+args   = cli.parse_args()
+LAYER  = args.layer
 
 subjects = args.subj or [p.name.split("-")[1] for p in DERIV.glob("sub-*")]
 
 for subj in subjects:
-    subj_prefix = f"sub-{subj}"
-    LOGGER.info(subj_prefix)
+    prefix = f"sub-{subj}"
+    LOGGER.info(prefix)
 
     try:
-        mask_img = nib.load(next((DERIV / subj_prefix).glob("*_brainmask.nii.gz")))
+        mask_img = nib.load(next((DERIV / prefix).glob("*_brainmask.nii.gz")))
     except StopIteration:
         LOGGER.warning("  mask not found – skipping")
         continue
 
-    Y_pred = np.load(RESULT_DIR / f"{subj_prefix}_{LAYER}_pred.npy").astype(np.float64)
-    Y_true = np.load(RESULT_DIR / f"{subj_prefix}_{LAYER}_true.npy").astype(np.float64)
-    LOGGER.info("  computing metrics  (%d trials, %d vox)",
-            Y_true.shape[0], Y_true.shape[1])
-    cov = (Y_true * Y_pred).mean(0) - Y_true.mean(0) * Y_pred.mean(0)
-    r  = cov / (Y_true.std(0) * Y_pred.std(0) + EPS)
-    r2 = 1 - ((Y_true - Y_pred)**2).sum(0) / (((Y_true - Y_true.mean(0))**2).sum(0) + EPS)
+    pred_f = RESULT_DIR / f"{prefix}_{LAYER}_pred.npy"
+    true_f = RESULT_DIR / f"{prefix}_{LAYER}_true.npy"
 
-    for arr, name in [(r, "r"), (r2, "r2")]:
+    Y_pred = np.load(pred_f).astype(np.float32, copy=False)
+    Y_true = np.load(true_f).astype(np.float32, copy=False)
+    n_tr, n_vox = Y_true.shape
+    LOGGER.info("  trials=%d   vox=%d", n_tr, n_vox)
+
+    r_out  = np.empty(n_vox, dtype=np.float32)
+    r2_out = np.empty(n_vox, dtype=np.float32)
+
+    for s in tqdm(range(0, n_vox, VOX_BATCH), desc="voxels"):
+        e   = min(s + VOX_BATCH, n_vox)
+        yt  = Y_true[:, s:e]
+        yp  = Y_pred[:, s:e]
+
+        cov = (yt * yp).mean(0) - yt.mean(0) * yp.mean(0)
+        r_out[s:e]  = cov / (yt.std(0) * yp.std(0) + EPS)
+
+        mse   = ((yt - yp) ** 2).sum(0)
+        var_t = ((yt - yt.mean(0)) ** 2).sum(0).clip(min=EPS)
+        r2_out[s:e] = 1.0 - mse / var_t
+        gc.collect()
+
+    for arr, tag in [(r_out, "r"), (r2_out, "r2")]:
         vol = np.zeros(mask_img.shape, dtype=np.float32)
         vol[mask_img.get_fdata() > 0] = arr
-        out = RESULT_DIR / f"{subj_prefix}_{LAYER}_{name}.nii.gz"
-        nib.save(nib.Nifti1Image(vol, mask_img.affine), out)
+        out = RESULT_DIR / f"{prefix}_{LAYER}_{tag}.nii.gz"
+        nib.save(nib.Nifti1Image(vol, mask_img.affine, mask_img.header), out)
         LOGGER.info("  wrote %s", out.name)
+
+    if not args.keep:
+        pred_f.unlink(missing_ok=True)
+        true_f.unlink(missing_ok=True)
+        LOGGER.info("  deleted temporary .npy files")
