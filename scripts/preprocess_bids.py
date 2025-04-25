@@ -2,94 +2,88 @@
 """
 preprocess_bids.py – FAST single-subject preprocessing for BOLD5000
 
-Creates *one* brain mask per subject so every run ends up with the same
-(voxel) columns.  Output: one .npy per run in data/sub-<ID>/.
+* One brain mask per subject
+* Minimal clean: detrend only (no high-pass, no standardise here)
+* Output: one .npy per run  (shape = TR × vox, float32)
 """
+from __future__ import annotations
 from pathlib import Path
-import numpy as np
-import nibabel as nib
+from joblib import Parallel, delayed
+import numpy as np, nibabel as nib
 from nilearn.masking import apply_mask, compute_epi_mask
 from nilearn.signal import clean
 from bids import BIDSLayout
-from joblib import Parallel, delayed
 from tqdm import tqdm
 from datalad import api as dl     # type: ignore
 
-from config import RAW, DERIV, LOGGER
+from config import RAW, DERIV, LOGGER, N_CORES, RAM_LIMIT
 
 # ───────── parameters ─────────
-N_JOBS          = 6
-HIGH_PASS       = 0.01
-DTYPE           = np.float32
-PLACEHOLDER_MAX = 1_000_000       # ≤1 MB ⇒ DataLad stub
-SUBJECTS_TO_RUN = {"CSI1"}        # edit or set empty for all subjects
+PLACEHOLDER_MAX = 1_000_000      # ≤1 MB ⇒ DataLad stub
+SUBJECTS_TO_RUN = {"CSI1"}       # empty set → all subjects
 
-# ───────── helper ─────────
+
 def _proc_one(run_path: str,
               mask_img: nib.Nifti1Image,
               out_path: Path,
               tr: float) -> tuple[int, int]:
-    """Load a BOLD run, apply subject mask, temporal clean, save .npy."""
+    """Load BOLD, apply mask, detrend, save .npy; return (TR, vox)."""
     if Path(run_path).stat().st_size < PLACEHOLDER_MAX:
-        dl.get(run_path) # pylint: disable=no-member
+        dl.get(run_path)        # ensure data downloaded
 
     data_2d = apply_mask(run_path, mask_img)          # TR × vox
     cleaned = clean(data_2d,
                     detrend=True,
-                    standardize="zscore_sample",
-                    high_pass=HIGH_PASS,
+                    standardize=False,    # we z-score later
+                    high_pass=None,
                     low_pass=None,
                     t_r=tr,
-                    confounds=None).astype(DTYPE)
-
+                    confounds=None).astype(np.float32)
     np.save(out_path.with_suffix(".npy"), cleaned, allow_pickle=False)
-    return cleaned.shape            # (n_TR, n_vox)
+    return cleaned.shape
 
-# ───────── main ─────────
+
 def main() -> None:
     layout = BIDSLayout(RAW, validate=False)
 
-    for subj in sorted(SUBJECTS_TO_RUN):
+    subjects = sorted(SUBJECTS_TO_RUN or
+                      {p.entities["subject"] for p in layout.get_suffix("bold")})
+    for subj in subjects:
         LOGGER.info("Subject %s", subj)
         subj_dir = DERIV / f"sub-{subj}"
-        subj_dir.mkdir(parents=True, exist_ok=True)
+        subj_dir.mkdir(exist_ok=True, parents=True)
 
         runs = layout.get(subject=subj, task="5000scenes",
                           suffix="bold", extension=[".nii", ".nii.gz"])
         if not runs:
-            LOGGER.warning("  no 5000-scenes runs – skipping")
-            continue
+            LOGGER.warning("  no 5000-scenes runs – skipping"); continue
 
-        # ── one mask per subject ─────────────────────────────────────────
+        # ── brain mask ──
         first_bold = runs[0].path
         if Path(first_bold).stat().st_size < PLACEHOLDER_MAX:
-            dl.get(first_bold) # pylint: disable=no-member
-
+            dl.get(first_bold)
         mask_path = subj_dir / f"sub-{subj}_brainmask.nii.gz"
-        if mask_path.exists():
-            mask_img = nib.load(mask_path)
-        else:
-            mask_img = compute_epi_mask(first_bold)
-            nib.save(mask_img, mask_path)
-            LOGGER.info("  saved mask → %s", mask_path)
+        mask_img = (nib.load(mask_path) if mask_path.exists()
+                    else compute_epi_mask(first_bold))
+        nib.save(mask_img, mask_path)
 
-        # ── job list (run_path, TR) ─────────────────────────────────────
+        # ── parallel clean ──
         jobs = [(r.path, float(r.get_metadata().get("RepetitionTime", 1.0)))
                 for r in runs]
-        LOGGER.info("  processing %d runs with %d job(s)…", len(jobs), N_JOBS)
+        LOGGER.info("  %d runs → %d workers", len(jobs), N_CORES)
 
-        def _job(run_path: str, tr: float):
-            out = subj_dir / Path(run_path).name.replace(".nii.gz", "").replace(".nii", "")
-            return _proc_one(run_path, mask_img, out, tr)
+        def _job(rp: str, tr: float):
+            out = subj_dir / Path(rp).name.replace(".nii.gz", "").replace(".nii", "")
+            return _proc_one(rp, mask_img, out, tr)
 
-        # ── execute in parallel ─────────────────────────────────────────
-        shapes = Parallel(n_jobs=N_JOBS, backend="loky", max_nbytes=None)(
+        shapes = Parallel(n_jobs=N_CORES, backend="loky", max_nbytes=None)(
             delayed(_job)(rp, tr) for rp, tr in tqdm(jobs, desc="runs")
         )
 
-        n_vox     = shapes[0][1]
-        total_trs = sum(s[0] for s in shapes)
-        LOGGER.info("  finished: %s vox × %s TRs", f"{n_vox:,}", f"{total_trs:,}")
+        vox = shapes[0][1]
+        trs = sum(s[0] for s in shapes)
+        LOGGER.info("  finished: %s vox × %s TRs", f"{vox:,}", f"{trs:,}")
+
 
 if __name__ == "__main__":
     main()

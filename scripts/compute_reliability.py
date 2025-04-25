@@ -1,20 +1,53 @@
-# scripts/compute_reliability.py
+#!/usr/bin/env python
+"""
+compute_reliability.py – Split-half voxel reliability (odd vs even runs).
+
+Outputs full-resolution reliability volume  (float32 .npy).
+"""
+from __future__ import annotations
+import argparse, gc
 from pathlib import Path
 import numpy as np, nibabel as nib
-from nilearn import masking
-from config import DERIV, RESULT_DIR
+from nilearn.masking import apply_mask
+from bids import BIDSLayout
+from config import RAW, DERIV, RESULT_DIR, LOGGER
 
-subj   = "CSI1"
-mask   = nib.load(next((DERIV / f"sub-{subj}").glob("*_brainmask.nii.gz")))
-runs   = sorted((DERIV / f"sub-{subj}").glob("*run-*_bold.npy"))
+cli = argparse.ArgumentParser()
+cli.add_argument("--subj", required=True, help="CSI1 (without 'sub-')")
+args = cli.parse_args(); subj = args.subj
 
-split1, split2 = np.array_split(runs, 2)
-def mean_img(run_list):
-    arr = np.vstack([np.load(p) for p in run_list]).mean(0)
-    vol = np.zeros(mask.shape, np.float32); vol[mask.get_fdata() > 0] = arr
-    return vol
+subj_dir = DERIV / f"sub-{subj}"
+mask_img = nib.load(next(subj_dir.glob("*_brainmask.nii.gz")))
+mask     = mask_img.get_fdata() > 0
 
-r = np.corrcoef(mean_img(split1)[mask.get_fdata()>0],
-                mean_img(split2)[mask.get_fdata()>0])[0,1]
-np.save(RESULT_DIR / f"sub-{subj}_reliability_mask.npy",
-        (r > 0.1).astype("uint8"))
+runs = sorted(subj_dir.glob("*_bold.npy"))
+if len(runs) < 2:
+    raise RuntimeError("Need ≥2 runs for split-half reliability.")
+
+odd_arr, even_arr = [], []
+for i, p in enumerate(runs):
+    data = np.load(p)
+    keep = ~np.all(data == 0, axis=1)
+    if not keep.any():
+        continue
+    (odd_arr if i % 2 else even_arr).append(data[keep])
+    gc.collect()
+
+if not odd_arr or not even_arr:
+    raise RuntimeError("Odd or even split ended up empty.")
+
+odd  = np.vstack(odd_arr)
+even = np.vstack(even_arr)
+min_len = min(len(odd), len(even))
+odd, even = odd[:min_len], even[:min_len]
+
+mu_o, mu_e = odd.mean(0), even.mean(0)
+cov = ((odd - mu_o) * (even - mu_e)).mean(0)
+r   = cov / (odd.std(0)*even.std(0) + 1e-12)
+
+rel_vol = np.zeros(mask.shape, np.float32)
+rel_vol[mask] = r
+out = RESULT_DIR / f"sub-{subj}_reliability.npy"
+np.save(out, rel_vol)
+LOGGER.info("Reliability map → %s  (min %.3f median %.3f max %.3f)",
+            out, r.min(), np.median(r), r.max())

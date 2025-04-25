@@ -1,32 +1,28 @@
 #!/usr/bin/env python
 """
-evaluate.py   –  fast, low-RAM, auto-cleanup
-Loads float16 predictions/truth, computes r & R² in 128-voxel chunks,
-writes NIfTIs, then deletes the heavy .npy files (unless --keep is given).
+evaluate.py – Compute voxel-wise r and R² in small chunks (128 vox).
+
+Writes NIfTI maps (r & r²) and optionally deletes heavy .npy files.
 """
 from __future__ import annotations
 import argparse, gc
 from pathlib import Path
-
-import numpy as np
-import nibabel as nib
+import numpy as np, nibabel as nib
 from tqdm import tqdm
-
 from config import DERIV, RESULT_DIR, LOGGER
 
 EPS        = 1e-7
 VOX_BATCH  = 128
 
-# ────────── CLI ──────────
 cli = argparse.ArgumentParser()
 cli.add_argument("--layer", required=True)
 cli.add_argument("--subj",  nargs="*", default=None)
-cli.add_argument("--keep",  action="store_true",
-                 help="Keep *_pred.npy and *_true.npy after evaluation")
-args   = cli.parse_args()
-LAYER  = args.layer
+cli.add_argument("--keep",  action="store_true")
+args  = cli.parse_args()
+LAYER = args.layer.replace(".npy", "")
 
-subjects = args.subj or [p.name.split("-")[1] for p in DERIV.glob("sub-*")]
+subjects = (args.subj or
+            [p.name.split("-")[1] for p in DERIV.glob("sub-*")])
 
 for subj in subjects:
     prefix = f"sub-{subj}"
@@ -35,11 +31,12 @@ for subj in subjects:
     try:
         mask_img = nib.load(next((DERIV / prefix).glob("*_brainmask.nii.gz")))
     except StopIteration:
-        LOGGER.warning("  mask not found – skipping")
-        continue
+        LOGGER.warning("  mask not found – skipping"); continue
 
     pred_f = RESULT_DIR / f"{prefix}_{LAYER}_pred.npy"
     true_f = RESULT_DIR / f"{prefix}_{LAYER}_true.npy"
+    if not (pred_f.exists() and true_f.exists()):
+        LOGGER.warning("  missing pred/true – skipping"); continue
 
     Y_pred = np.load(pred_f).astype(np.float32, copy=False)
     Y_true = np.load(true_f).astype(np.float32, copy=False)

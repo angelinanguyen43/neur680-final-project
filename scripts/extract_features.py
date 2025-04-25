@@ -1,45 +1,37 @@
 #!/usr/bin/env python
 """
-extract_features.py
-Global-average-pooled ResNet-50 features for every stimulus JPEG/PNG.
-Outputs one .npy per layer (float32) + stimulus_index.csv.
+extract_features.py – ResNet-50 global-avg-pooled features for every image.
 
-*Change log*
--------------
-✓ `stimulus_id` is now **the path relative to SCENE_ROOT** (e.g.
-  ``COCO/val2017/000000123456.jpg``) instead of only the bare file-name.  
-  This removes name collisions across COCO / ImageNet / Scene folders.
+Produces four files:
+    features/resnet50_layer{1-4}.npy   (float32, n_img × C)
+and   features/stimulus_index.csv
 """
+from __future__ import annotations
 from pathlib import Path
 from typing import List
-
-from PIL import Image
-import numpy as np
-import pandas as pd
-import torch
-from torchvision import models
 from tqdm import tqdm
+from PIL import Image
+import numpy as np, pandas as pd, torch
+from torchvision import models
 
-from config import FEAT_DIR, LOGGER, get_all_scene_files, SCENE_ROOT
+from config import FEAT_DIR, LOGGER, get_scene_files, SCENE_ROOT
 
 DEVICE  = "cuda" if torch.cuda.is_available() else "cpu"
-LAYERS  = ["layer1", "layer2", "layer3", "layer4"]     # conv2_x – conv5_x
+LAYERS  = ["layer1", "layer2", "layer3", "layer4"]
 
 
 def main() -> None:
-    scene_files: List[Path] = get_all_scene_files()
+    scene_files: List[Path] = get_scene_files()
     LOGGER.info("Found %d stimulus images", len(scene_files))
 
     weights = models.ResNet50_Weights.IMAGENET1K_V2
     resnet  = models.resnet50(weights=weights).to(DEVICE).eval()
 
-    # ─── register forward hooks ───
     activations = {ln: [] for ln in LAYERS}
 
     def _capture(name: str):
-        """Hook that global-avg-pools H×W → (B, C)."""
         def hook(_, __, out):
-            pooled = out.mean(dim=(2, 3))      # (B, C, H, W) → (B, C)
+            pooled = out.mean(dim=(2, 3))         # global-avg-pool
             activations[name].append(pooled.cpu().to(torch.float32))
         return hook
 
@@ -49,14 +41,13 @@ def main() -> None:
     preprocess = weights.transforms()
 
     with torch.inference_mode():
-        for img_path in tqdm(scene_files, desc="ResNet-50"):
-            img = preprocess(Image.open(img_path).convert("RGB")).unsqueeze(0).to(DEVICE)
-            resnet(img)              # hooks fill `activations`
+        for p in tqdm(scene_files, desc="ResNet-50"):
+            img = preprocess(Image.open(p).convert("RGB")).unsqueeze(0).to(DEVICE)
+            resnet(img)           # hooks fill `activations`
 
-    # ─── save ───
     FEAT_DIR.mkdir(exist_ok=True)
-    for ln, acts in activations.items():
-        arr = torch.cat(acts, dim=0).numpy()          # (n_img, channels)
+    for ln in LAYERS:
+        arr = torch.cat(activations[ln], dim=0).numpy()
         np.save(FEAT_DIR / f"resnet50_{ln}.npy", arr, allow_pickle=False)
         LOGGER.info("%s: saved %s", ln, arr.shape)
 
@@ -64,6 +55,7 @@ def main() -> None:
         "stimulus_id": [p.relative_to(SCENE_ROOT).as_posix() for p in scene_files],
         "filepath"   : [str(p) for p in scene_files],
     }).to_csv(FEAT_DIR / "stimulus_index.csv", index=False)
+    LOGGER.info("stimulus_index.csv written")
 
 
 if __name__ == "__main__":

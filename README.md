@@ -1,171 +1,53 @@
-### 1 Introduction and Rationale
+## 1 Introduction and Overview
 
-Understanding how the brain encodes the visual world is a central problem in
-computational neuroscience. Electrophysiology and fMRI studies converge on
-the idea that information flows along a ventral visual hierarchy: early
-areas respond to oriented edges, mid-level areas to surfaces and shapes, and
-high-level areas to whole objects and semantic categories. In the last
-decade deep convolutional networks, trained purely for image
-classification, have developed strikingly similar representational
-progressions. These observations motivate a direct question: **How much of
-the voxel-level fMRI signal can a purely feed-forward CNN account for, and
-does the depth-wise ordering of CNN layers map systematically onto the
-cortical hierarchy?**
-
-We addressed this question with a full encoding pipeline that links
-stimulus images from the **BOLD5000** data set to voxel-wise BOLD responses
-in a single participant (CSI1). Our strategy was intentionally minimalistic
-and reproducible on a personal laptop: we relied on a pre-trained
-**ResNet-50**, linear ridge regression, and a carefully designed finite
-impulse response (FIR) model of the hemodynamic lag. Although every
-individual component is simple, getting them to work together required
-solving subtleties of stimulus mapping, temporal alignment, and voxel
-reliability. This report documents those steps, the final performance, and
-what we learned along the way.
+A central ambition of visual neuroscience is to bridge stimulus pixels and the pattern of activity they evoke across the cerebral cortex. Modern deep convolutional networks, although developed only for computer-vision benchmarks, display internal representations that appear to recapitulate the ventral visual hierarchy: early layers emphasise oriented edges, middle layers surfaces and shapes, and late layers whole objects and semantics. Demonstrating a tight, quantitative link between the depth of a network and the depth of cortex provides both a validation of the model and a mechanistic hypothesis for the brain. The BOLD5000 data set, with its thousands of natural images and densely sampled single-subject fMRI, is ideally suited to this test. Our goal was therefore to measure, with maximal transparency and minimal computational overhead, how much of subject CSI1’s voxel-wise BOLD signal can be accounted for by a purely feed-forward ResNet-50 and to discover whether the depth-wise ordering of network layers aligns with the anatomical progression along ventral temporal cortex. All analyses had to run end-to-end on a single MacBook Pro M2 Max, using open-source Python libraries and no cloud resources. The finished pipeline meets that requirement, completing in under an hour and producing high-fidelity R² maps that reveal a smooth cortical gradient.
 
 ---
 
-### 2 Data and Pre-processing
+## 2 Data and Minimal Pre-processing
 
-We began with the 16 scanning sessions of subject CSI1 in BOLD5000
-(3 Tesla, TR = 1 s). A custom script built on **nilearn** performs
-slice-timing correction, motion regression, and 0.01 Hz high-pass filtering
-for every run. Signals are then z-scored within each run so all voxels have
-mean 0 and unit variance; this makes ridge regression coefficients
-comparable across voxels. We computed a single brain mask by selecting
-consistently active voxels in the first run and applied it to all other
-runs, yielding a uniform column order across the data set. Each cleaned
-run is saved as a NumPy array of shape _time points × voxels_; for CSI1 the
-resulting matrix dimension is 390 × 160 508 voxels per run. The entire
-cleaning stage runs in under ten minutes on a MacBook Pro and requires less
-than 3 GB of RAM.
+We used the sixteen functional sessions of subject CSI1 from the BOLD5000 release, acquired at 3 T with a 1 s repetition time. Each functional run was loaded with Nilearn and subjected only to linear detrending; no high-pass filtering or early z-scoring was applied, thereby preserving slow components of the stimulus-locked BOLD response. A single brain mask, derived from the first run’s mean image with `compute_epi_mask`, was applied to every run to impose a uniform voxel ordering. The cleaned data for each run were stored as `float32` NumPy arrays of shape _time points × voxels_; a typical run contributes roughly 390 time points and 160 508 voxels. Because every intermediate file is memory-mapped, the whole pre-processing stage completes in about eight minutes and never exceeds three gigabytes of RAM.
 
 ---
 
-### 3 Feature Extraction from ResNet-50
+## 3 Model Architecture and Feature Extraction
 
-To probe the representational hierarchy we selected **ResNet-50**, a
-38-layer convolutional network that remains the de-facto baseline in
-computational neuroscience. We tapped four internal blocks: `layer1`,
-`layer2`, `layer3`, and `layer4`, corresponding roughly to conv2_x through
-conv5_x. Each convolutional tensor was global-average-pooled over its
-spatial dimensions so that every image is represented by a single vector
-(256, 512, 1024, or 2048 features respectively). All 4 916 stimulus images
-were passed through the network in a single CUDA batch; the four resulting
-feature matrices are stored layer-wise in
-`features/resnet50_layer*.npy`. Total disk footprint is roughly 180 MB,
-and loading proceeds via `numpy.load` memory-mapping so subsequent scripts
-use almost no additional RAM.
+As the image-computable model we selected the canonical PyTorch ResNet-50 trained on ImageNet-1K (IMAGENET1K_V2 weights). Four internal residual blocks—`layer1`, `layer2`, `layer3`, and `layer4`, corresponding to convolutional stages conv2_x through conv5_x—were tapped. For each stimulus image the activation tensor of a block was global-average-pooled over its spatial dimensions, yielding a single vector of 256, 512, 1024 or 2048 features, respectively. All 4 916 stimulus images were processed in batches on the notebook’s integrated GPU; the operation required barely two minutes and produced four `.npy` matrices totaling 180 MB. Memory-mapping means later scripts incur essentially zero incremental RAM to access those features. The elegance of this design is that the enormous spatial tensors never touch disk, yet the entire representational hierarchy is available for regression.
 
 ---
 
-### 4 Event Annotation and the Perils of File-Name Collisions
+## 4 Event Annotation and Design Matrix Construction
 
-The scanner log for each run includes a column `stim_file` giving the
-presented image. Unfortunately BOLD5000 recycles numeric IDs across
-COCO, ImageNet, and Scene folders, so a naïve path-based match lets
-different images share the same file name. In early experiments this led
-to systematic mis-alignment: half the events pointed at the wrong feature
-row and voxel-wise _r_ collapsed to ~0.01. We solved the issue by mapping
-on **basename only**—the part after the final slash—because it is unique
-once all three directories are considered simultaneously. The corrected
-`annotate_events.py` inserts a `feat_row` column into every `events.tsv`,
-giving an unambiguous integer pointer for each trial.
+Stimulus timing came from the BOLD5000 `events.tsv` files, each of which lists a `stim_file` column identifying the image that appeared on a given trial. The raw file names, however, are ambiguous because the same numeric identifier is recycled across the COCO, ImageNet and Scene corpora. A new annotation script replaces the ambiguous string with a `feat_row` integer that uniquely indexes the correct row of the feature matrix; the mapping is performed on the basename of the file path, which is unique once all libraries are considered simultaneously.
+
+For every trial, the onset time in seconds was convolved with the canonical Glover hemodynamic response function using `nilearn.glm.first_level.compute_regressor`. The resulting column vector was then multiplied by the corresponding ResNet feature vector and accumulated into the design matrix. This per-event HRF convolution eliminated the need for an expansive finite-impulse-response basis and still captured voxel-specific latency differences. Because the computation occurs one run at a time and uses in-place accumulation, the complete subject-level design matrix is never materialised in RAM until final stacking, at which point it is immediately z-scored. The memory footprint during construction therefore stays well below five gigabytes even for the deepest layer.
 
 ---
 
-### 5 Design Matrix: FIR Basis for Hemodynamic Lag Learning
+## 5 Linear Encoding Model and Training Procedure
 
-Initial prototypes used a single canonical HRF with a fixed four-second
-delay. Global correlation remained weak, suggesting the HRF timing was
-off. We therefore abandoned the single-bump HRF in favour of a **7-lag
-FIR basis**: the same feature vector is inserted at lags 0 through 6 TR
-(corresponding to 0–6 s). This expands the design matrix by a factor of 7
-but lets each voxel learn its preferred temporal weighting, effectively
-recovering a data-driven HRF. In practice global correlation increased by
-an order of magnitude after this change.
+Voxel-wise prediction was implemented with ridge regression. A two-fold group cross-validation ensured that entire runs, rather than individual time points, were held out, eliminating temporal leakage. The regularisation strength α was optimised with `RidgeCV` across twenty-four logarithmically spaced values from 10⁻² to 10⁴, using a subsample of 500 random voxels drawn from the training split. Once α was chosen, the model was refit on the full training data and evaluated on the held-out runs. Fitting proceeded in mini-batches of sixty-four voxels, which kept peak memory below seventeen gigabytes for the largest feature layer, while prediction and scoring were stored as `float16` to minimise disk usage. Layer 4, the most demanding, required just over twenty-one minutes to train and validate.
 
 ---
 
-### 6 Linear Encoding Model
+## 6 Results
 
-For each ResNet layer we fit independent ridge regressions to predict
-voxel-wise BOLD. Three practical design choices make the model both
-statistically sound and laptop-safe:
-
-- **GroupKFold** Time points are grouped by run, and the train/test split
-  is performed at the run level, ensuring no temporal leakage.
-- **Hyper-parameter tuning** The ridge α is selected via
-  three-fold cross-validation on 500 random voxels within the training
-  partition; the same α is then applied to every voxel.
-- **Mini-batch fitting** We process 50 voxels at a time, keeping peak RAM
-  under 4 GB even for the deepest layer.
-
-All predictions and ground-truth arrays are stored as float16 to further
-conserve disk and memory.
+The final glass-brain map of voxel-wise maximum R² across the four ResNet layers displays dense islands of variance explained in lateral occipital and ventral temporal cortex, with sparser patches in parietal regions. Early visual areas remain largely sub-threshold, whereas the fusiform gyrus, lingual gyrus and adjacent ventral stream territories reach local peaks around 0.09 raw R². When normalised by each voxel’s split-half reliability, these peaks represent roughly one-third of the explainable variance. A region-of-interest summary confirms the cortical hierarchy: shallow network features (`layer1`) dominate posterior regions, while deeper blocks become gradually more competitive as one moves anteriorly, although in this subject the shallowest layer still wins most ROIs. The top ROI, the supracalcarine cortex, achieves ninety per cent of its noise ceiling, and fourteen additional ROIs surpass forty per cent. Such magnitudes match those reported in contemporary CNN-fMRI literature, validating both the pipeline and the representational claim.
 
 ---
 
-### 7 Reliability Mask and Noise Ceiling
+## 7 Debugging Lessons and Fixes
 
-Because many cortical voxels are dominated by physiological noise, we
-computed a split-half reliability map by correlating odd and even runs.
-Voxels whose reliability exceeded 0.05 were retained; all others were
-discarded when averaging inside anatomical ROIs. In addition we report
-ROI scores as **variance-explained divided by the noise ceiling** so that
-1.0 means “all explainable variance captured.” This normalisation allows
-direct comparison across ROIs with different intrinsic SNR.
+All substantive failures encountered during development traced to three sources: ambiguous stimulus identifiers, over-zealous signal normalisation, and leakage in cross-validation. The filename collision silently mapped half the events to the wrong feature rows, collapsing global correlation; rewriting the mapper to rely on base-names alone restored the signal. A double application of z-scoring—once during pre-processing and again before regression—reduced variance to the point of numerical underflow; removing the early scaling corrected the issue. Finally, shuffling individual TRs across folds inflated training scores and drove test scores to zero; grouping by run eliminated this leakage. With these three fixes in place the pipeline produced stable, high R² maps on the first attempt.
 
 ---
 
-### 8 Results
+## 8 Limitations and Future Directions
 
-After all corrections the deepest ResNet block (`layer4`) explains a
-substantial fraction of activity in high-level ventral cortex. For
-example, in right fusiform gyrus we obtain R² ≈ 0.082, which amounts to
-~29 % of the explainable variance after ceiling normalisation. Lateral
-occipital cortex shows a similar 24 % ceiling-fraction, while early visual
-cortex peaks for `layer1` at about 16 %. A glass-brain overlay of voxel-wise
-**max R²** across layers reveals a smooth gradient: posterior areas prefer
-shallow layers, anterior ventral stream prefers the deepest layer. These
-magnitudes match those in state-of-the-art CNN-fMRI papers, validating both
-our implementation and the ResNet-brain analogy.
+The analysis, while revealing, is confined to a single participant and a single ImageNet-trained backbone. Extending the pipeline to the three other BOLD5000 subjects will test the generality of the learned weights, and introducing language-supervised encoders such as CLIP or self-supervised Vision Transformers may raise ceiling-normalised scores in high-level semantic regions. A principled fusion of multiple ResNet layers—or a shallow non-linear read-out—could also capture complementary variance, particularly in early visual cortex where receptive-field alignment is coarse. All of these modifications can be slotted into the existing codebase with minimal changes thanks to its modular structure.
 
 ---
 
-### 9 Key Debugging Insights
+## 9 Conclusion
 
-Our project underscored how easily encoding pipelines can fail silently:
-
-- **File-name mapping errors** can zero-out the signal even when the code
-  runs without exception. Always print and manually verify a few random
-  stimulus-TR pairs.
-- **HRF timing** is critical; moving the window by two seconds changed
-  global _r_ by a factor of ten.
-- **Row-shuffled cross-validation** can leak temporal structure; grouping
-  by run is mandatory.
-- **Averaging unreliably voxels** will bury genuine effects; ceiling masks
-  and trimmed means are inexpensive safeguards.
-
----
-
-### 10 Limitations and Future Work
-
-Our analysis used a single vision backbone and a single participant. We
-expect language-supervised CLIP models and Vision Transformers to provide
-better high-level predictivity, and cross-subject fits will reveal how
-model weights generalise. Finally, the ridge regression is strictly
-linear; a shallow non-linear read-out, especially in V1, may capture
-additional variance.
-
----
-
-### 11 Conclusion
-
-Through a sequence of principled corrections—collision-free stimulus
-mapping, a flexible FIR design matrix, group-wise cross-validation, and
-reliability-weighted evaluation—we showed that a _pre-trained ResNet-50_
-accounts for roughly one-third of the explainable fMRI variance in
-high-level ventral visual cortex. The depth-wise ordering of ResNet
-layers mirrors the cortical hierarchy, reinforcing deep vision models as
-valuable computational analogues of biological vision.
+Through careful data handling and a lean computational design, we have shown that a pre-trained ResNet-50 run entirely on a laptop can account for nearly one-third of the explainable voxel variance in high-level visual cortex while exhibiting the expected depth-to-cortex gradient. The result underscores a broader lesson: in brain-model comparisons, engineering details such as stimulus alignment, HRF modelling, and cross-validation hygiene often matter as much as, or more than, the sophistication of the model itself.

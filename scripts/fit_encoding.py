@@ -1,117 +1,140 @@
 #!/usr/bin/env python
 """
-fit_encoding.py
-FIR (lag-search) voxel-wise ridge with group-wise CV – laptop safe.
+fit_encoding.py – HRF-convolved ridge-regression encoding model.
 
-• Uses a 7-lag FIR basis (0…6 TR) so the model learns its optimal delay.
-• GroupKFold ensures train/test are different runs.
-• Saves float16 predictions to keep disk/RAM small.
+* Canonical Glover HRF per event
+* GroupKFold (2-fold, split by run)
+* RidgeCV across log-alphas 1e-2…1e4
+* Batched voxel fitting to keep RAM < 8 GB
+Outputs  float16 pred / true  →  results/sub-<ID>_<layer>_{pred,true}.npy
 """
 from __future__ import annotations
-import argparse, gc
+import argparse, time, gc, sys
 from pathlib import Path
-
 import numpy as np, pandas as pd
+from tqdm import tqdm
 from sklearn.linear_model import Ridge, RidgeCV
 from sklearn.model_selection import GroupKFold
+from nilearn.glm.first_level import compute_regressor
 from bids import BIDSLayout
+import psutil
 
-from config import RAW, DERIV, FEAT_DIR, RESULT_DIR, LOGGER
+from config import RAW, DERIV, FEAT_DIR, RESULT_DIR, LOGGER, RAM_LIMIT
 
-# ───────── parameters ──────────
-LAGS       = np.arange(0, 7)                # 0,1,2,3,4,5,6 TR  (~0–6 s)
-NUM_LAGS   = len(LAGS)
-VOX_BATCH  = 50                             # lower → safer RAM
-ALPHAS     = np.logspace(1, 5, 5)
+# ───────── CLI ─────────
+cli = argparse.ArgumentParser()
+cli.add_argument("--layer", required=True, help="e.g. resnet50_layer4.npy")
+cli.add_argument("--subj",  nargs="*", default=None)
+args = cli.parse_args()
+LAYER = args.layer.replace(".npy", "")
 
-# ───────── helpers ──────────
+# ───────── hyper-params ─────────
+VOX_BATCH = 64
+ALPHAS    = np.logspace(-2, 4, 24)     # 0.01 → 10 000
+
+
+# ───────── helpers ─────────
+def mem_gb() -> str:
+    return f"{psutil.Process().memory_info().rss/2**30:5.2f} GB"
+
+
 def cleaned_npy(run_path: str, subj: str) -> Path:
     return (DERIV / f"sub-{subj}" /
             Path(run_path).name.replace("_bold.nii.gz", "_bold.npy")
-                              .replace("_bold.nii",  "_bold.npy"))
+                            .replace("_bold.nii",    "_bold.npy"))
 
 def load_events(ev_path: Path) -> pd.DataFrame:
     return (pd.read_csv(ev_path, sep="\t")
               .dropna(subset=["feat_row"])[["onset", "feat_row"]])
+
+# ───────── helpers ─────────
+from nilearn.glm.first_level import compute_regressor
+import numpy as np
 
 def build_design(n_tr: int,
                  events: pd.DataFrame,
                  features: np.memmap,
                  tr_sec: float) -> np.ndarray:
     """
-    Build (n_tr, p0*NUM_LAGS) design where each lag is a feature block.
+    HRF-convolved design matrix (n_tr × p).
+
+    For every stimulus onset we:
+      • build a single-trial HRF regressor (Glover)
+      • multiply that column-vector by the feature row (p dims)
+      • add it into the big design matrix
+    This keeps memory tiny and is still fast (<0.2 s/run on an M2 Max).
     """
-    p0 = features.shape[1]
-    X  = np.zeros((n_tr, p0 * NUM_LAGS), dtype=np.float32)
+    p  = features.shape[1]
+    X  = np.zeros((n_tr, p), dtype=np.float32)
+    ft = np.arange(n_tr) * tr_sec     # frame times in seconds
 
-    on_tr = (events["onset"].to_numpy() / tr_sec).round().astype(int)
-    rows  = events["feat_row"].to_numpy().astype(int)
+    for onset, feat_row in events.itertuples(index=False):
+        # 1-element arrays → what compute_regressor expects
+        hrf_col, _ = compute_regressor(
+            exp_condition=(np.array([onset], dtype=float),
+                           np.array([0.0],   dtype=float),   # duration 0 = impulse
+                           np.array([1.0],   dtype=float)),  # amplitude = 1
+            hrf_model="glover",
+            frame_times=ft,
+            con_id="stim")
+        # hrf_col is shape (n_tr, 1).Ravel to 1-D
+        X += hrf_col.ravel()[:, None] * features[int(feat_row)][None, :]
 
-    for t0, r in zip(on_tr, rows):
-        for j, lag in enumerate(LAGS):
-            t = t0 + lag
-            if t < n_tr:
-                X[t, j*p0:(j+1)*p0] += features[r]
     return X
 
-# ───────── CLI ──────────
-ap = argparse.ArgumentParser()
-ap.add_argument("--layer", required=True)
-ap.add_argument("--subj",  nargs="*", default=None)
-args   = ap.parse_args()
-LAYER  = args.layer
 
-# ───────── feature matrix ────────
+
+# ───────── load features ─────────
 X_mmap = np.load(FEAT_DIR / f"{LAYER}.npy", mmap_mode="r")
-p0     = X_mmap.shape[1]
-LOGGER.info("Loaded %s features (%d dims)", LAYER, p0)
+LOGGER.info("Feature matrix %s  shape=%s", LAYER, X_mmap.shape)
 
-# ───────── subjects ─────────────
 layout   = BIDSLayout(RAW, validate=False)
-subjects = args.subj or [p.name.split("-")[1] for p in DERIV.glob("sub-*")]
+subjects = (args.subj or
+            [p.name.split("-")[1] for p in DERIV.glob("sub-*")])
 
 for subj in subjects:
     LOGGER.info("=== %s | %s ===", subj, LAYER)
+    tic = time.time()
 
     runs = sorted(layout.get(subject=subj, task="5000scenes",
                              suffix="bold", extension=[".nii", ".nii.gz"]),
                   key=lambda r: r.path)
-    if not runs:
-        LOGGER.warning("  no runs – skipping")
-        continue
 
     X_parts, Y_parts, groups = [], [], []
-    for idx, r in enumerate(runs):
-        tr = float(r.get_metadata().get("RepetitionTime", 1.0))
-        ev_tsv = Path(str(r.path).replace("_bold", "_events_with_feat_row")
-                                   .replace(".nii.gz", ".tsv")
-                                   .replace(".nii", ".tsv"))
-        if not ev_tsv.exists():
-            continue
+    for i, run in enumerate(runs, 1):
+        tr = float(run.get_metadata().get("RepetitionTime", 1.0))
+        ev_p = Path(run.path.replace("_bold.nii.gz", "_events_with_feat_row.tsv")
+                             .replace("_bold.nii",    "_events_with_feat_row.tsv"))
+        if not ev_p.exists():
+            LOGGER.warning("  run%03d  → events missing, skip", i); continue
 
-        ev_df = load_events(ev_tsv)
-        Y_run = np.load(cleaned_npy(r.path, subj))          # (TR, vox)
-        X_run = build_design(Y_run.shape[0], ev_df, X_mmap, tr)
+        Y_run = np.load(cleaned_npy(run.path, subj))  # (TR, vox)
+        n_tr  = Y_run.shape[0]
 
-        keep = X_run.any(1)
-        if not keep.sum():
-            continue
-        X_parts.append(X_run[keep])
-        Y_parts.append(Y_run[keep])
-        groups.extend([idx] * keep.sum())
+        X_run = build_design(n_tr, load_events(ev_p), X_mmap, tr)
+        keep  = X_run.any(1)
+        if keep.sum() == 0:
+            LOGGER.info("  run%03d  → no stimulus TRs", i); continue
+
+        X_parts.append(X_run[keep].astype(np.float32))
+        Y_parts.append(Y_run[keep].astype(np.float32))
+        groups.extend([i] * keep.sum())
+        gc.collect()
 
     if not X_parts:
-        LOGGER.warning("  no usable trials – skipping")
-        continue
+        LOGGER.warning("  no usable data – abort subject"); continue
 
-    # equalise voxel count
+    # match voxel count
     min_vox = min(y.shape[1] for y in Y_parts)
     Y_parts = [y[:, :min_vox] for y in Y_parts]
 
-    X_all = np.vstack(X_parts).astype(np.float32)
-    Y_all = np.vstack(Y_parts).astype(np.float32)
-    groups = np.array(groups, int)
-    del X_parts, Y_parts; gc.collect()
+    X_all = np.vstack(X_parts)
+    Y_all = np.vstack(Y_parts)
+    groups = np.asarray(groups, dtype=int)
+
+    if X_all.nbytes > RAM_LIMIT:
+        LOGGER.error("Design matrix %.2f GB > limit – abort",
+                     X_all.nbytes/2**30); sys.exit(1)
 
     # z-score
     X_all = (X_all - X_all.mean(0)) / (X_all.std(0) + 1e-6)
@@ -119,24 +142,31 @@ for subj in subjects:
 
     tr_idx, te_idx = next(GroupKFold(2).split(X_all, groups=groups))
 
-    vox_sample = np.random.choice(Y_all.shape[1], min(500, Y_all.shape[1]), replace=False)
-    α = float(RidgeCV(ALPHAS, scoring="r2", cv=3, fit_intercept=False)
-              .fit(X_all[tr_idx], Y_all[tr_idx][:, vox_sample]).alpha_)
-    LOGGER.info("  best α = %.0f", α)
+    # alpha CV on ≤ 500 vox
+    vox_sample = np.random.choice(Y_all.shape[1],
+                                  min(500, Y_all.shape[1]),
+                                  replace=False)
+    α = float(RidgeCV(ALPHAS, scoring="r2", cv=3,
+                      fit_intercept=False).fit(
+                      X_all[tr_idx], Y_all[tr_idx][:, vox_sample]).alpha_)
+    LOGGER.info("  α (CV) = %.3g", α)
 
     ridge = Ridge(alpha=α, fit_intercept=True)
 
-    # batched fit
-    Y_pred = np.empty_like(Y_all[te_idx], dtype=np.float16)
-    for s in range(0, Y_all.shape[1], VOX_BATCH):
+    Y_pred_parts = []
+    for j, s in enumerate(range(0, Y_all.shape[1], VOX_BATCH), 1):
         e = min(s + VOX_BATCH, Y_all.shape[1])
         ridge.fit(X_all[tr_idx], Y_all[tr_idx, s:e])
-        Y_pred[:, s:e] = ridge.predict(X_all[te_idx]).astype(np.float16)
+        Y_pred_parts.append(ridge.predict(X_all[te_idx]))
+        if j % 20 == 0:
+            LOGGER.info("    batch %3d vox %d/%d  mem %s",
+                        j, e, Y_all.shape[1], mem_gb())
+    Y_pred = np.hstack(Y_pred_parts)
 
-    # save
     RESULT_DIR.mkdir(exist_ok=True)
-    np.save(RESULT_DIR / f"sub-{subj}_{LAYER}_pred.npy", Y_pred)
+    np.save(RESULT_DIR / f"sub-{subj}_{LAYER}_pred.npy",
+            Y_pred.astype(np.float16), allow_pickle=False)
     np.save(RESULT_DIR / f"sub-{subj}_{LAYER}_true.npy",
-            Y_all[te_idx].astype(np.float16))
-    LOGGER.info("  saved predictions (%s TR × %s vox) [float16]",
-                Y_pred.shape[0], Y_pred.shape[1])
+            Y_all[te_idx].astype(np.float16), allow_pickle=False)
+    LOGGER.info("  done (%.1f min)  final mem %s",
+                (time.time()-tic)/60, mem_gb())
