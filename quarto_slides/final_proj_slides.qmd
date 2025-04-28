@@ -119,7 +119,7 @@ After some more in-depth analysis, the figure below shows:
 :::
 
 ::: {.column width="50%"}
-![](/final_proj2/figures/sub-CSI1_encoding_summary.png){width=100%}
+![](../figures/sub-CSI1_encoding_summary.png){width=100%}
 :::
 
 :::
