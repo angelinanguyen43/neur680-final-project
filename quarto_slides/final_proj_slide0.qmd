@@ -1,0 +1,178 @@
+---
+title: "Predicting Human Brain Responses to Visual Stimuli Using Deep Neural Network Features"
+format: revealjs
+author: "Mara Oancea, AJ Shulman, Marin Soderberg, Angelina Nguyen"
+execute:
+    echo: true
+    eval: false
+engine: python
+---
+
+
+# Abstract
+
+::: {.small}
+Our project aims to investigate the extent to which deep neural network representations of images align with human brain activity during visual perception. Specifically, we will explore whether features extracted from pretrained vision models can accurately predict fMRI activation patterns in the visual cortex when participants view natural images.
+To do this, we will use a publicly available dataset such as the Natural Scenes Dataset (NSD) or BOLD5000, both of which provide high-quality fMRI data paired with visual stimuli. For each image, we will extract hierarchical feature embeddings from various layers of a deep neural network. We will then build voxel-wise encoding models (e.g., ridge regression) to map these features to BOLD responses in predefined regions of interest (ROIs) within the visual system (e.g., V1, V4, LOC, PPA, FFA).
+This project builds on prior work suggesting that the layered structure of deep vision models corresponds to the hierarchical processing observed in the human visual cortex. Our findings may help clarify how well artificial systems mirror biological vision and could provide insights into the interpretability of neural networks through a neuroscientific lens.
+:::
+
+## Data sources
+::: {.small}
+Modern deep convolutional networks, although developed only for computer-vision benchmarks, display internal representations that appear to recapitulate the ventral visual hierarchy: early layers emphasise oriented edges, middle layers surfaces and shapes, and late layers whole objects and semantics. We will use the BOLD5000 data set- with its thousands of natural images and densely sampled single-subject fMRI, it is ideally suited to this test. Our goal was therefore to measure, with maximal transparency and minimal computational overhead, how much of subject CSI1’s voxel-wise BOLD signal can be accounted for by a purely feed-forward ResNet-50 and to discover whether the depth-wise ordering of network layers aligns with the anatomical progression along ventral temporal cortex.
+:::
+---
+## DATA LOADING/PREPROCESSING: IMPORTS  
+These are the necessary imports and variable initializations for the data preprocessing. This code can all be seen in preprocess_bids.py: 
+```{python}
+# example of data processing - imports
+from __future__ import annotations
+from pathlib import Path
+from joblib import Parallel, delayed
+import numpy as np, nibabel as nib
+from nilearn.masking import apply_mask, compute_epi_mask
+from nilearn.signal import clean
+from bids import BIDSLayout
+from tqdm import tqdm
+from datalad import api as dl 
+#import sys
+#from pathlib import Path
+
+#sys.path.append(str(Path().parent / "scripts"))
+from config import RAW, DERIV, LOGGER, N_CORES, RAM_LIMIT
+
+# ───────── parameters ─────────
+PLACEHOLDER_MAX = 1_000_000      # ≤1 MB ⇒ DataLad stub
+SUBJECTS_TO_RUN = {"CSI1"}       # empty set → all subjects
+
+
+```
+
+---
+## SINGLE SUBJECT PROCESSING
+::: {.small}
+
+- We defined a function (`preprocess_bids.py`) that processes the BOLD5000 dataset for a single subject.
+- It **isolates one brain mask**, extracting only brain voxels (3D shape of variables changing over time).
+- It **cleans** the data by **detrending** the time series (removes slow drifts).
+- Saves the result as a **NumPy matrix** of shape **TR × vox**:
+  - **TR** = "repetition time" (time between consecutive fMRI images)
+  - **vox** = number of brain voxels (different locations/layers).
+- Uses **nilearn**, a standard neuroimaging package, for these operations.
+
+:::
+---
+```{python}
+import sys
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parents[1]     # FINAL_PROJ/
+print(ROOT)
+def _proc_one(run_path: str,
+              mask_img: nib.Nifti1Image,
+              out_path: Path,
+              tr: float) -> tuple[int, int]:
+    """Load BOLD, apply mask, detrend, save .npy; return (TR, vox)."""
+    if Path(run_path).stat().st_size < PLACEHOLDER_MAX:
+        dl.get(run_path)        # ensure data downloaded
+
+    data_2d = apply_mask(run_path, mask_img)          # TR × vox
+    cleaned = clean(data_2d,
+                    detrend=True,
+                    standardize=False,    # we z-score later
+                    high_pass=None,
+                    low_pass=None,
+                    t_r=tr,
+                    confounds=None).astype(np.float32)
+    np.save(out_path.with_suffix(".npy"), cleaned, allow_pickle=False)
+    return cleaned.shape
+```
+
+---
+## LOOP THROUGH ALL SUBJECTS
+Then, loop through all subjects and run the function above to clean all subject data. This is the basic loading of the raw MRI data into a standard form ((TR x voxel) numpy matrix) in order to be fed into the machine learning model. 
+
+```{python}
+layout = BIDSLayout(RAW, validate=False)
+
+subjects = sorted(SUBJECTS_TO_RUN or
+                    {p.entities["subject"] for p in layout.get_suffix("bold")})
+for subj in subjects:
+    LOGGER.info("Subject %s", subj)
+    subj_dir = DERIV / f"sub-{subj}"
+    subj_dir.mkdir(exist_ok=True, parents=True)
+
+    runs = layout.get(subject=subj, task="5000scenes",
+                          suffix="bold", extension=[".nii", ".nii.gz"])
+    if not runs:
+        LOGGER.warning("  no 5000-scenes runs – skipping"); continue
+
+        # ── brain mask ──
+    first_bold = runs[0].path
+    if Path(first_bold).stat().st_size < PLACEHOLDER_MAX:
+            dl.get(first_bold)
+    mask_path = subj_dir / f"sub-{subj}_brainmask.nii.gz"
+    mask_img = (nib.load(mask_path) if mask_path.exists()
+                    else compute_epi_mask(first_bold))
+    nib.save(mask_img, mask_path)
+
+        # ── parallel clean ──
+    jobs = [(r.path, float(r.get_metadata().get("RepetitionTime", 1.0)))
+                for r in runs]
+    LOGGER.info("  %d runs → %d workers", len(jobs), N_CORES)
+
+    def _job(rp: str, tr: float):
+            out = subj_dir / Path(rp).name.replace(".nii.gz", "").replace(".nii", "")
+            return _proc_one(rp, mask_img, out, tr)
+
+    shapes = Parallel(n_jobs=N_CORES, backend="loky", max_nbytes=None)(
+    delayed(_job)(rp, tr) for rp, tr in tqdm(jobs, desc="runs")
+        )
+
+    vox = shapes[0][1]
+    trs = sum(s[0] for s in shapes)
+    LOGGER.info("  finished: %s vox × %s TRs", f"{vox:,}", f"{trs:,}")
+
+```
+---
+## PART 2: STIMULUS TIMING DATA 
+Stimulus timing came from the BOLD5000 `events.tsv` files, each of which lists a `stim_file` column identifying the image that appeared on a given trial. We replace the raw data's ambiguous string identifier with a `feat_row` integer that uniquely indexes the correct row of the feature matrix.
+```{python}
+stim_df = pd.read_csv(FEAT_DIR / "stimulus_index.csv")
+id2row  = {Path(p).name: i for i, p in enumerate(stim_df["stimulus_id"])}
+
+layout = BIDSLayout(RAW, validate=False)
+for ev in layout.get(suffix="events", extension=".tsv"):
+    df = pd.read_csv(ev.path, sep="\t")
+    if "stim_file" not in df.columns:
+        continue
+    df["feat_row"] = df["stim_file"].map(lambda s: id2row.get(Path(s).name))
+    out = Path(ev.path).with_name(
+        Path(ev.path).stem.replace("_events", "_events_with_feat_row") + ".tsv")
+    df.to_csv(out, sep="\t", index=False)
+    LOGGER.info("wrote %s", out.relative_to(RAW.parent))
+```
+
+## ANALYSIS SUMMARY 
+ 1. Perform basic data preprocessing and organization to prepare the fMRI and stimulus data (what is shown)
+ 2. Next, we extracted visual features from each stimulus image using PyTorch’s ResNet-50 model pretrained on ImageNet-1K. 
+ 3. Finally, we trained a linear encoding model using ridge regression to predict each brain voxel’s fMRI response based on the extracted feature representations.
+---
+::: {.columns}
+
+::: {.column width="50%"}
+::: {.small}
+
+After some more in-depth analysis, the figure below shows:
+- **Top**: The ResNet layer that gives the best prediction for a given voxel (glass-brain view).
+- **Bottom**: Each brain region (x-axis) is analyzed by how much variance the model explains for each ResNet layer.
+  - The **orange bar** highlights the best-performing layer for each region.
+
+:::
+:::
+
+::: {.column width="50%"}
+![](figures/sub-CSI1_encoding_summary.png){width=100%}
+:::
+
+:::
