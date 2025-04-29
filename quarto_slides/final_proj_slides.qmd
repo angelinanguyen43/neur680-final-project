@@ -110,16 +110,16 @@ for ev in layout.get(suffix="events", extension=".tsv"):
 ::: {.column width="50%"}
 ::: {.tiny}
 
-After some more in-depth analysis, the figure below shows:
-- **Top**: The ResNet layer that gives the best prediction for a given voxel (glass-brain view).
-- **Bottom**: Each brain region (x-axis) is analyzed by how much variance the model explains for each ResNet layer.
-  - The **orange bar** highlights the best-performing layer for each region.
+We created this extremely basic figure to show that we were able to access the BOLD data.
+- **Top**: Basic subject count - (we are showing you 4) subejcts, 
+-**TOP R**: Then how many scanning sessions were run for each subject
+- **Bottom**: How many runs per session for one subject (10-15 min chunk). We also include the voxel dimensions and info.
 
 :::
 :::
 
 ::: {.column width="50%"}
-![](../figures/sub-CSI1_encoding_summary.png){width=100%}
+![](../figures/raw_data.jpeg){width=100%}
 :::
 
 :::
