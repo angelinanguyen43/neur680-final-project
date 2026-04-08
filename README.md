@@ -1,3 +1,9 @@
+## About this Project
+
+This was completed as a group final project for NEUR0680: Introduction to Computational Neuroscience at Brown University. I contributed to the research design, implementation, and write-up. Full project report included in the repository.
+
+---
+
 ## 1 Introduction and Overview
 
 A central ambition of visual neuroscience is to bridge stimulus pixels and the pattern of activity they evoke across the cerebral cortex. Modern deep convolutional networks, although developed only for computer-vision benchmarks, display internal representations that appear to recapitulate the ventral visual hierarchy: early layers emphasise oriented edges, middle layers surfaces and shapes, and late layers whole objects and semantics. Demonstrating a tight, quantitative link between the depth of a network and the depth of cortex provides both a validation of the model and a mechanistic hypothesis for the brain. The BOLD5000 data set, with its thousands of natural images and densely sampled single-subject fMRI, is ideally suited to this test. Our goal was therefore to measure, with maximal transparency and minimal computational overhead, how much of subject CSI1’s voxel-wise BOLD signal can be accounted for by a purely feed-forward ResNet-50 and to discover whether the depth-wise ordering of network layers aligns with the anatomical progression along ventral temporal cortex. All analyses had to run end-to-end on a single MacBook Pro M2 Max, using open-source Python libraries and no cloud resources. The finished pipeline meets that requirement, completing in under an hour and producing high-fidelity R² maps that reveal a smooth cortical gradient.
