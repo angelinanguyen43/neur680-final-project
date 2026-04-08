@@ -1,6 +1,6 @@
 ## About this Project
 
-This was completed as a group final project for NEUR0680: Introduction to Computational Neuroscience at Brown University. I contributed to the research design, implementation, and write-up. Full project report included in the repository.
+This was completed as a group final project for NEUR0680: Introduction to Computational Neuroscience at Brown University with Mara Oancea, AJ Shulman, and Marin Soderberg. I contributed to the research design, implementation, and write-up.
 
 ---
 
